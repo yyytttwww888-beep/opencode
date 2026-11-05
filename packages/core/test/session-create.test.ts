@@ -1310,6 +1310,139 @@ describe("Session.create", () => {
 })
 
 describe("SessionTransfer", () => {
+  const marker = "PRIVATE_EXPORT_MARKER"
+  const at = DateTime.makeUnsafe(100)
+  const error = {
+    type: "provider_error",
+    message: marker,
+    status: 429,
+    response: { body: marker },
+    retryAfterMs: 1_000,
+  }
+  const assistant = (fields: Partial<SessionMessage.Assistant>): SessionMessage.Assistant => ({
+    id: SessionMessage.ID.create(),
+    type: "assistant",
+    agent: Agent.ID.make("build"),
+    model: Model.Ref.make({ id: Model.ID.make("model"), providerID: Provider.ID.make("provider") }),
+    content: [],
+    time: { created: at, completed: at },
+    ...fields,
+  })
+  const cases: Record<string, () => SessionMessage.Info> = {
+    "assistant native data": () => assistant({ native: { blockedText: marker } }),
+    "assistant errors": () => assistant({ error }),
+    "assistant retry errors": () => assistant({ retry: { attempt: 2, at, error } }),
+    "tool errors": () =>
+      assistant({
+        content: [
+          {
+            type: "tool",
+            id: "call_export",
+            name: "read",
+            state: { status: "error", input: {}, error },
+            time: { created: at, completed: at },
+          },
+        ],
+      }),
+    "compaction errors": () => ({
+      id: SessionMessage.ID.create(),
+      type: "compaction",
+      status: "failed",
+      reason: "manual",
+      error,
+      time: { created: at },
+    }),
+    "idle errors": () => ({
+      id: SessionMessage.ID.create(),
+      type: "idle",
+      outcome: "failed",
+      error,
+      time: { created: at },
+    }),
+    "location history": () => ({
+      id: SessionMessage.ID.create(),
+      type: "location-switched",
+      location: Location.Ref.make({ directory: AbsolutePath.make(`/current/${marker}`) }),
+      subpath: RelativePath.make(`current/${marker}`),
+      previous: {
+        location: Location.Ref.make({ directory: AbsolutePath.make(`/previous/${marker}`) }),
+        subpath: RelativePath.make(`previous/${marker}`),
+      },
+      time: { created: at },
+    }),
+    "snapshot file names": () => assistant({ snapshot: { files: [RelativePath.make(`${marker}.ts`)] } }),
+    "system descriptions": () => ({
+      id: SessionMessage.ID.create(),
+      type: "system",
+      text: "Instruction update",
+      description: marker,
+      time: { created: at },
+    }),
+    "skill names": () => ({
+      id: SessionMessage.ID.create(),
+      type: "skill",
+      skill: Skill.ID.make("example"),
+      name: Skill.Name.make(marker),
+      text: "Instructions",
+      time: { created: at },
+    }),
+  }
+
+  for (const [name, create] of Object.entries(cases)) {
+    it.effect(`sanitizes ${name} without changing the stored transcript`, () =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        const transfer = yield* SessionTransfer.Service
+        const template = yield* session.create({ location })
+        const message = create()
+        const source = yield* transfer.import({
+          data: { info: { ...template, id: Session.ID.create() }, messages: [message] },
+          location,
+        })
+        const original = yield* transfer.export({ sessionID: source.id })
+        expect(JSON.stringify(original)).toContain(marker)
+
+        const sanitized = yield* transfer.export({ sessionID: source.id, sanitize: true })
+        expect(JSON.stringify(sanitized)).not.toContain(marker)
+        expect(sanitized.messages).toMatchObject([{ id: message.id, type: message.type, time: message.time }])
+        expect(yield* transfer.export({ sessionID: source.id })).toEqual(original)
+        yield* session.remove(source.id)
+        const imported = yield* transfer.import({
+          data: { ...sanitized, info: { ...sanitized.info, id: Session.ID.create() } },
+          location,
+        })
+        expect((yield* transfer.export({ sessionID: imported.id })).messages).toEqual(sanitized.messages)
+        if (message.type === "assistant" && message.error)
+          expect(sanitized.messages[0]).toMatchObject({
+            error: { type: "provider_error", status: 429, retryAfterMs: 1_000 },
+          })
+      }),
+    )
+  }
+
+  it.effect("sanitizes the current session subpath without changing its location", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const transfer = yield* SessionTransfer.Service
+      const { db } = yield* Database.Service
+      const source = yield* session.create({ location })
+      yield* db
+        .update(SessionTable)
+        .set({ path: `packages/${marker}` })
+        .where(eq(SessionTable.id, source.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      const sanitized = yield* transfer.export({ sessionID: source.id, sanitize: true })
+      expect(JSON.stringify(sanitized)).not.toContain(marker)
+      expect(sanitized.info.subpath).toBe(RelativePath.make(`[redacted:session-subpath:${source.id}]`))
+      expect((yield* transfer.export({ sessionID: source.id })).info).toMatchObject({
+        location,
+        subpath: `packages/${marker}`,
+      })
+    }),
+  )
+
   it.effect("exports only settled projected messages", () =>
     Effect.gen(function* () {
       const session = yield* Session.Service
@@ -1534,7 +1667,7 @@ describe("SessionTransfer", () => {
           text: `[redacted:text:${sourceMessageID}]`,
           skills: [{ id: "effect", name: "[redacted:skill-name:0]", text: "[redacted:skill:0]" }],
         },
-        { id: errorMessageID, error: { type: "test_error", message: "Original error" } },
+        { id: errorMessageID, error: { type: "test_error", message: `[redacted:error-message:${errorMessageID}]` } },
       ])
 
       yield* session.prompt({ sessionID, text: "Continue", resume: false })
